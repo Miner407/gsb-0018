@@ -1,0 +1,27 @@
+# 数据库文件
+samples.db
+test_samples.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# 测试输出日志
+*.log
+test_output/
+test_logs/
+
+# IDE 配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 操作系统文件
+.DS_Store
+Thumbs.db

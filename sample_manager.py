@@ -4,7 +4,16 @@ import os
 import sys
 
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples.db')
+def get_db_path():
+    env_path = os.environ.get('SAMPLE_DB_PATH')
+    if env_path:
+        if not os.path.isabs(env_path):
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), env_path)
+        return env_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'samples.db')
+
+
+DB_PATH = get_db_path()
 
 
 SAMPLE_TYPE_CODES = {
@@ -21,11 +30,25 @@ SAMPLE_TYPE_CODES = {
 STATUS_AVAILABLE = '在库'
 STATUS_BORROWED = '借出'
 
+SORT_CREATED_DESC = 'created_desc'
+SORT_CREATED_ASC = 'created_asc'
+SORT_COLLECT_DESC = 'collect_desc'
+SORT_COLLECT_ASC = 'collect_asc'
+
+MAX_SEQ = 9999
+
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def set_db_path(path):
+    global DB_PATH
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    DB_PATH = path
 
 
 def init_db():
@@ -91,31 +114,70 @@ def generate_sample_no(sample_type):
     else:
         seq = 1
 
-    sample_no = f'{prefix}{seq:04d}'
-
-    cursor.execute("SELECT COUNT(*) as count FROM samples WHERE sample_no = ?", (sample_no,))
-    if cursor.fetchone()['count'] > 0:
-        for i in range(seq + 1, 10000):
-            candidate = f'{prefix}{i:04d}'
-            cursor.execute("SELECT COUNT(*) as count FROM samples WHERE sample_no = ?", (candidate,))
-            if cursor.fetchone()['count'] == 0:
-                sample_no = candidate
-                break
+    sample_no = None
+    for candidate_seq in range(seq, MAX_SEQ + 1):
+        candidate = f'{prefix}{candidate_seq:04d}'
+        cursor.execute("SELECT COUNT(*) as count FROM samples WHERE sample_no = ?", (candidate,))
+        if cursor.fetchone()['count'] == 0:
+            sample_no = candidate
+            break
 
     conn.close()
-    return sample_no
+
+    if sample_no is None:
+        return None, f'样本编号生成失败：当月同类型样本序号已超出范围（最大 {MAX_SEQ}）'
+
+    return sample_no, None
 
 
-def add_sample(sample_type, source, collect_date, storage_location, manager, remark=''):
-    if sample_type not in SAMPLE_TYPE_CODES:
-        return False, f'样本类型无效，可选类型：{", ".join(SAMPLE_TYPE_CODES.keys())}'
+def _validate_required(field_name, value):
+    if value is None or str(value).strip() == '':
+        return False, f'{field_name}不能为空'
+    return True, None
 
+
+def _validate_collect_date(collect_date):
+    if not collect_date:
+        return False, '采集日期不能为空'
     try:
-        datetime.datetime.strptime(collect_date, '%Y-%m-%d')
+        date_obj = datetime.datetime.strptime(collect_date, '%Y-%m-%d')
     except ValueError:
         return False, '采集日期格式错误，请使用 YYYY-MM-DD 格式'
 
-    sample_no = generate_sample_no(sample_type)
+    today = datetime.date.today()
+    if date_obj.date() > today:
+        return False, '采集日期不能晚于当前日期'
+
+    return True, None
+
+
+def add_sample(sample_type, source, collect_date, storage_location, manager, remark=''):
+    ok, err = _validate_required('样本类型', sample_type)
+    if not ok:
+        return False, err
+    if sample_type not in SAMPLE_TYPE_CODES:
+        return False, f'样本类型无效，可选类型：{", ".join(SAMPLE_TYPE_CODES.keys())}'
+
+    ok, err = _validate_required('样本来源', source)
+    if not ok:
+        return False, err
+
+    ok, err = _validate_collect_date(collect_date)
+    if not ok:
+        return False, err
+
+    ok, err = _validate_required('保存位置', storage_location)
+    if not ok:
+        return False, err
+
+    ok, err = _validate_required('负责人', manager)
+    if not ok:
+        return False, err
+
+    sample_no, err = generate_sample_no(sample_type)
+    if err:
+        return False, err
+
     created_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     conn = get_db_connection()
@@ -126,8 +188,8 @@ def add_sample(sample_type, source, collect_date, storage_location, manager, rem
             '''INSERT INTO samples (sample_no, sample_type, source, collect_date, 
                storage_location, manager, status, created_at, remark)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (sample_no, sample_type, source, collect_date,
-             storage_location, manager, STATUS_AVAILABLE, created_at, remark)
+            (sample_no, sample_type, source.strip(), collect_date,
+             storage_location.strip(), manager.strip(), STATUS_AVAILABLE, created_at, remark or '')
         )
         conn.commit()
         return True, sample_no
@@ -138,7 +200,8 @@ def add_sample(sample_type, source, collect_date, storage_location, manager, rem
         conn.close()
 
 
-def query_samples(sample_type=None, manager=None, location=None, status=None):
+def query_samples(sample_type=None, manager=None, location=None, status=None,
+                  collect_date_start=None, collect_date_end=None, sort_by=SORT_CREATED_DESC):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -157,8 +220,23 @@ def query_samples(sample_type=None, manager=None, location=None, status=None):
     if status:
         query += " AND status = ?"
         params.append(status)
+    if collect_date_start:
+        query += " AND collect_date >= ?"
+        params.append(collect_date_start)
+    if collect_date_end:
+        query += " AND collect_date <= ?"
+        params.append(collect_date_end)
 
-    query += " ORDER BY created_at DESC"
+    if sort_by == SORT_CREATED_ASC:
+        query += " ORDER BY created_at ASC"
+    elif sort_by == SORT_CREATED_DESC:
+        query += " ORDER BY created_at DESC"
+    elif sort_by == SORT_COLLECT_ASC:
+        query += " ORDER BY collect_date ASC"
+    elif sort_by == SORT_COLLECT_DESC:
+        query += " ORDER BY collect_date DESC"
+    else:
+        query += " ORDER BY created_at DESC"
 
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -177,6 +255,17 @@ def get_sample_by_no(sample_no):
 
 
 def borrow_sample(sample_no, borrower, purpose=''):
+    if not sample_no or str(sample_no).strip() == '':
+        return False, '样本编号不能为空'
+
+    ok, err = _validate_required('借用人', borrower)
+    if not ok:
+        return False, err
+
+    ok, err = _validate_required('用途', purpose)
+    if not ok:
+        return False, err
+
     sample = get_sample_by_no(sample_no)
     if not sample:
         return False, '样本不存在'
@@ -198,7 +287,7 @@ def borrow_sample(sample_no, borrower, purpose=''):
         cursor.execute(
             '''INSERT INTO borrow_records (sample_no, borrower, borrow_date, purpose, status)
                VALUES (?, ?, ?, ?, ?)''',
-            (sample_no, borrower, borrow_date, purpose, '借出中')
+            (sample_no, borrower.strip(), borrow_date, purpose.strip(), '借出中')
         )
 
         conn.commit()
@@ -211,6 +300,9 @@ def borrow_sample(sample_no, borrower, purpose=''):
 
 
 def return_sample(sample_no):
+    if not sample_no or str(sample_no).strip() == '':
+        return False, '样本编号不能为空'
+
     sample = get_sample_by_no(sample_no)
     if not sample:
         return False, '样本不存在'
@@ -242,6 +334,9 @@ def return_sample(sample_no):
                    WHERE id = ?''',
                 (return_date, row['id'])
             )
+        else:
+            conn.rollback()
+            return False, '未找到对应的借出记录'
 
         conn.commit()
         return True, '归还成功'
@@ -326,7 +421,7 @@ def print_borrow_records_table(records):
         print('  ' + ' | '.join(row))
 
 
-def input_with_default(prompt, default=None):
+def input_with_default(prompt, default=None, required=True):
     if default:
         result = input(f'{prompt} (默认: {default}): ').strip()
         return result if result else default
@@ -335,7 +430,10 @@ def input_with_default(prompt, default=None):
             result = input(f'{prompt}: ').strip()
             if result:
                 return result
-            print('  输入不能为空，请重新输入')
+            if required:
+                print('  输入不能为空，请重新输入')
+            else:
+                return result
 
 
 def menu_add_sample():
@@ -419,7 +517,32 @@ def menu_query_samples():
         else:
             print('  选择无效，请重新输入')
 
-    samples = query_samples(sample_type, manager, location, status)
+    collect_start = input('  采集日期起 (YYYY-MM-DD，留空不限制): ').strip() or None
+    collect_end = input('  采集日期止 (YYYY-MM-DD，留空不限制): ').strip() or None
+
+    print('  排序方式:')
+    print('    1. 登记时间降序 (默认)')
+    print('    2. 登记时间升序')
+    print('    3. 采集日期降序')
+    print('    4. 采集日期升序')
+    sort_by = SORT_CREATED_DESC
+    sort_choice = input('  请选择 (默认1): ').strip()
+    if sort_choice == '2':
+        sort_by = SORT_CREATED_ASC
+    elif sort_choice == '3':
+        sort_by = SORT_COLLECT_DESC
+    elif sort_choice == '4':
+        sort_by = SORT_COLLECT_ASC
+
+    samples = query_samples(
+        sample_type=sample_type,
+        manager=manager,
+        location=location,
+        status=status,
+        collect_date_start=collect_start,
+        collect_date_end=collect_end,
+        sort_by=sort_by
+    )
     print(f'\n  查询结果: 共 {len(samples)} 条记录')
     print_sample_table(samples)
 
@@ -441,7 +564,7 @@ def menu_borrow_sample():
         return
 
     borrower = input_with_default('  借用人')
-    purpose = input('  借出用途 (可选): ').strip()
+    purpose = input_with_default('  借出用途')
 
     success, msg = borrow_sample(sample_no, borrower, purpose)
     if success:
